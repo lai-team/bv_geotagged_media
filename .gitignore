@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Editors / IDEs / tooling
+.claude/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# Dependencies / build output
+/vendor/
+/node_modules/
+composer.lock
+package-lock.json
+
+# Local config & secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+debug.log
+error_log
