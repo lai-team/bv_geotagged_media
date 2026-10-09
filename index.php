@@ -14,10 +14,69 @@
 global $special_categories;
 $special_categories = array('private','standalone','uncategorized');
 
-$special_cat_ids = array();
-foreach ($special_categories as $cat){
-	$qid=get_category_by_slug($cat);
-	if(!empty($qid)) $special_cat_ids+=array( $qid->term_id );
+/*
+ * A $special_cat_ids array used to be built here. It was removed: it
+ * accumulated with `+=`, which is union *by key*, so after the first element
+ * every subsequent `+= array( $term_id )` was discarded and it could only ever
+ * hold one id. Nothing read it, and building it ran three
+ * get_category_by_slug() queries at file scope on every request, admin
+ * included.
+ */
+
+/**
+ * Whether a URL points at an image, by extension.
+ *
+ * These two helpers previously lived in gtm_plugin_main.php_gentrit, a file
+ * WordPress never loads because of its extension, so they did not exist at
+ * runtime -- which is why bv_map/includes/compat.php had to reimplement them
+ * for voyage's story-list template. They belong in the media plugin. bv_map's
+ * copies are behind function_exists(), and so are these -- whichever plugin
+ * loads first wins and the other defers. Without a guard on both sides a load
+ * order where bv_map came first would be a fatal redeclare.
+ *
+ * The original split on "." and took the last segment, which treats a query
+ * string as part of the extension. This parses the URL first.
+ *
+ * @param string $url File URL or path.
+ * @return bool
+ */
+if ( ! function_exists( 'isImage' ) ) {
+	function isImage( $url ) { // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.FunctionNameInvalid
+		return bv_gtm_url_has_extension( $url, array( 'JPG', 'JPEG', 'PNG', 'GIF', 'TIFF', 'RAW', 'WEBP' ) );
+	}
+}
+
+/**
+ * Whether a URL points at a video, by extension.
+ *
+ * @param string $url File URL or path.
+ * @return bool
+ */
+if ( ! function_exists( 'isVideo' ) ) {
+	function isVideo( $url ) { // phpcs:ignore WordPress.NamingConventions.ValidFunctionName.FunctionNameInvalid
+		return bv_gtm_url_has_extension(
+			$url,
+			array( 'WEBM', 'MPG', 'MP2', 'MPEG', 'MPE', 'MPV', 'OGG', 'MP4', 'M4P', 'M4V', 'AVI', 'WMV', 'MOV', 'QT', 'FLV', 'SWF' )
+		);
+	}
+}
+
+/**
+ * Match a URL's extension against a whitelist, ignoring any query string.
+ *
+ * @param string   $url        File URL or path.
+ * @param string[] $extensions Uppercase extensions to accept.
+ * @return bool
+ */
+function bv_gtm_url_has_extension( $url, $extensions ) { // phpcs:ignore
+	if ( ! is_string( $url ) || '' === $url ) {
+		return false;
+	}
+
+	$path      = wp_parse_url( $url, PHP_URL_PATH );
+	$extension = pathinfo( $path ? $path : $url, PATHINFO_EXTENSION );
+
+	return in_array( strtoupper( $extension ), $extensions, true );
 }
 
 /**
@@ -25,8 +84,38 @@ foreach ($special_categories as $cat){
  * @param string $file the location of the image
  * @return array longitude, latitude and datetime created
  */
+/**
+ * Divide an EXIF rational ("num/den") safely.
+ *
+ * The six coordinate components used to be divided directly, e.g.
+ * `$lat_degrees_a[0] / $lat_degrees_a[1]`, with no check that the denominator
+ * existed or was non-zero. A rational with a zero or missing denominator is a
+ * DivisionByZeroError on PHP 8 -- a fatal, during an upload.
+ *
+ * @param string $rational EXIF rational, e.g. "54/1".
+ * @return float
+ */
+function bv_gtm_exif_rational( $rational ) {
+	$parts = explode( '/', (string) $rational );
+	$num   = isset( $parts[0] ) ? (float) $parts[0] : 0.0;
+	$den   = isset( $parts[1] ) ? (float) $parts[1] : 1.0;
+
+	return 0.0 === $den ? 0.0 : $num / $den;
+}
+
 function read_gps_location($file){
-	$info = exif_read_data($file);
+	// exif_read_data() warns and returns false for anything that is not a
+	// JPEG/TIFF, and it was previously called for every attachment -- PDFs,
+	// video, audio -- after which $info['DateTimeOriginal'] warned too.
+	if ( ! is_string( $file ) || ! function_exists( 'exif_read_data' ) || ! isImage( $file ) ) {
+		return array();
+	}
+
+	$info = @exif_read_data( $file );
+
+	if ( ! is_array( $info ) ) {
+		return array();
+	}
 	//error_log(print_r(' file Info: '. json_encode($info),true));
 	// print_r($info);
 	if (isset($info['GPSLatitude']) && isset($info['GPSLongitude']) &&
@@ -36,19 +125,20 @@ function read_gps_location($file){
 		$GPSLatitudeRef  = strtolower(trim($info['GPSLatitudeRef']));
 		$GPSLongitudeRef = strtolower(trim($info['GPSLongitudeRef']));
 
-		$lat_degrees_a = explode('/',$info['GPSLatitude'][0]);
-		$lat_minutes_a = explode('/',$info['GPSLatitude'][1]);
-		$lat_seconds_a = explode('/',$info['GPSLatitude'][2]);
-		$lng_degrees_a = explode('/',$info['GPSLongitude'][0]);
-		$lng_minutes_a = explode('/',$info['GPSLongitude'][1]);
-		$lng_seconds_a = explode('/',$info['GPSLongitude'][2]);
+		// GPSLatitude/GPSLongitude are arrays of three rationals; a camera
+		// that omits one leaves the offset undefined.
+		if ( ! isset( $info['GPSLatitude'][2], $info['GPSLongitude'][2] ) ) {
+			return isset( $info['DateTimeOriginal'] )
+				? array( 'datetime' => $info['DateTimeOriginal'] )
+				: array();
+		}
 
-		$lat_degrees = $lat_degrees_a[0] / $lat_degrees_a[1];
-		$lat_minutes = $lat_minutes_a[0] / $lat_minutes_a[1];
-		$lat_seconds = $lat_seconds_a[0] / $lat_seconds_a[1];
-		$lng_degrees = $lng_degrees_a[0] / $lng_degrees_a[1];
-		$lng_minutes = $lng_minutes_a[0] / $lng_minutes_a[1];
-		$lng_seconds = $lng_seconds_a[0] / $lng_seconds_a[1];
+		$lat_degrees = bv_gtm_exif_rational( $info['GPSLatitude'][0] );
+		$lat_minutes = bv_gtm_exif_rational( $info['GPSLatitude'][1] );
+		$lat_seconds = bv_gtm_exif_rational( $info['GPSLatitude'][2] );
+		$lng_degrees = bv_gtm_exif_rational( $info['GPSLongitude'][0] );
+		$lng_minutes = bv_gtm_exif_rational( $info['GPSLongitude'][1] );
+		$lng_seconds = bv_gtm_exif_rational( $info['GPSLongitude'][2] );
 
 		$lat = (float) $lat_degrees+((($lat_minutes*60)+($lat_seconds))/3600);
 		$lng = (float) $lng_degrees+((($lng_minutes*60)+($lng_seconds))/3600);
@@ -58,16 +148,23 @@ function read_gps_location($file){
 		$GPSLatitudeRef  == 's' ? $lat *= -1 : '';
 		$GPSLongitudeRef == 'w' ? $lng *= -1 : '';
 
-		return array(
+		$result = array(
 			'lat' => $lat,
 			'lng' => $lng,
-			'datetime' =>$info['DateTimeOriginal']
 		);
-	}     
-	return array(
-		'datetime' =>$info['DateTimeOriginal']
-	);
-	//return false;
+
+		if ( isset( $info['DateTimeOriginal'] ) ) {
+			$result['datetime'] = $info['DateTimeOriginal'];
+		}
+
+		return $result;
+	}
+
+	// No usable GPS. DateTimeOriginal was read unguarded here, which warned on
+	// any image without it.
+	return isset( $info['DateTimeOriginal'] )
+		? array( 'datetime' => $info['DateTimeOriginal'] )
+		: array();
 }
 
 add_action("add_attachment", 'bv_attachment');
@@ -99,9 +196,23 @@ function bv_attachment($attachment_ID)
 	}
 }
 
+/*
+ * Hooked to save_post only.
+ *
+ * It was also attached to transition_post_status at priority 30, but the two
+ * hooks pass incompatible arguments: save_post gives ( $post_id, $post,
+ * $update ) while transition_post_status gives ( $new_status, $old_status,
+ * $post ). On the latter the first parameter was a status string, so
+ * get_post_type( 'publish' ) returned false and the callback returned
+ * immediately -- the hook never did anything. Removing the registration
+ * preserves current behaviour exactly; wiring it up properly would introduce
+ * new, untested double-processing.
+ *
+ * That also resolves a second bug: the re-entrancy guard below called
+ * remove_action( 'transition_post_status', ... ) without a priority, so it did
+ * not match the registration at 30 and never detached anything.
+ */
 add_action( 'save_post', 'bv_thumbnailmeta_postmeta', 10, 2 );
-//add_action('publish_post', 'bv_thumbnailmeta_postmeta', 20, 2 );
-add_action( 'transition_post_status', 'bv_thumbnailmeta_postmeta', 30, 2 );
 function bv_thumbnailmeta_postmeta($post,$post_obj)
 {
 	if ( get_post_type($post) != 'post' ) return;
@@ -120,8 +231,6 @@ function bv_thumbnailmeta_postmeta($post,$post_obj)
 			if ( ! wp_is_post_revision( $post ) ){
 				// unhook this function so it doesn't loop infinitely
 				remove_action('save_post', 'bv_thumbnailmeta_postmeta');
-				//remove_action('publish_post', 'bv_thumbnailmeta_postmeta' );
-				remove_action( 'transition_post_status', 'bv_thumbnailmeta_postmeta' );
 				// update the post, which calls save_post again
 				wp_update_post( $my_args );
 				if ( isset($geom_point) && !empty($geom_point)){
@@ -137,8 +246,6 @@ function bv_thumbnailmeta_postmeta($post,$post_obj)
 				//bv_update_bothline1($post); not needed. Function is called via another hook with lower priority.
 				// re-hook this function
 				add_action('save_post', 'bv_thumbnailmeta_postmeta',10,2);
-				//add_action('publish_post', 'bv_thumbnailmeta_postmeta', 20, 2 );
-				add_action( 'transition_post_status', 'bv_thumbnailmeta_postmeta', 30, 2 );
 			}
 		/*
 		var_error_log('datetime ' . $datetime . ' of post ' . $post);
@@ -149,8 +256,19 @@ function bv_thumbnailmeta_postmeta($post,$post_obj)
 	}
 }
 
-function bv_get_nghbpost_geom($get_value=false,$current_post,$previous=true,$arr_slugs=array(), $excluded_terms = '', $taxonomy = 'category'){
-	$current_point= $current_post->geom_point;	
+/*
+ * $get_value keeps its default for call-site compatibility, but declaring an
+ * optional parameter before a required one is deprecated in PHP 8.0 and the
+ * notice fired on every load into a debug.log that is enabled in production.
+ * Giving $current_post a default silences it without changing any call site --
+ * all four pass both arguments positionally.
+ */
+function bv_get_nghbpost_geom($get_value=false,$current_post=null,$previous=true,$arr_slugs=array(), $excluded_terms = '', $taxonomy = 'category'){
+	if ( ! $current_post || ! function_exists( 'bv_get_adjacent_post' ) ) {
+		return null; // bv_get_adjacent_post() is provided by the voyage plugin.
+	}
+
+	$current_point= $current_post->geom_point;
 	if (empty($current_point)) return;
 	$ref_post=$current_post;
 	while ( !empty($adjacent_post=bv_get_adjacent_post($ref_post,$previous,$arr_slugs,$excluded_terms,$taxonomy)) ){
@@ -175,8 +293,15 @@ add_action( 'trashed_post', 'bv_update_catline',300,2);
 function bv_update_gline2($current_post,$where=0,$term_id=0, $excluded_terms = '', $taxonomy = 'category'){
 	//$wp_geoutil = WP_GeoUtil::get_instance();
 	if ($term_id == 0) return;
+
+	// WP_GeoUtil comes from WP-GeoMeta and was called unguarded below, so
+	// deactivating that plugin made every post save fatal.
+	if ( ! class_exists( 'WP_GeoUtil' ) ) {
+		return;
+	}
+
 	$metakey_cat='geom_line2__'. strval($term_id) ;
-	$current_point= $current_post->geom_point;	
+	$current_point= $current_post->geom_point;
 	if (empty($current_point)) return;
 
 	$geom_line=get_post_meta($current_post->ID,  $metakey_cat , true);
@@ -200,6 +325,18 @@ function bv_update_gline2($current_post,$where=0,$term_id=0, $excluded_terms = '
 	//error_log(print_r(' neXT: '. $next_point,true));
 
 	$geom_line_new= WP_GeoUtil::LineString( $previous_point, $current_point, $next_point) ;
+
+	/*
+	 * WP_GeoUtil::__callStatic() returns null when the function is not in
+	 * get_capabilities(). The installed WP-GeoMeta is hand-patched
+	 * (wp-geoutil.php:714) to add 'linestring' and 'point'; any update to that
+	 * plugin reverts the patch, after which this is null and the line below
+	 * would overwrite a good geom_line with nothing. Leave the existing value
+	 * alone instead.
+	 */
+	if ( empty( $geom_line_new ) ) {
+		return $geom_line;
+	}
 	//error_log(print_r('		 classMethods: '. json_encode(get_class_methods("wp_geoutil") ) , true));
 	//error_log(print_r('		 geomCapabilities: '. json_encode(WP_GeoUtil::get_capabilities()) , true));
 	//error_log(print_r('		 geomFuncs: '. json_encode(WP_GeoUtil::get_all_funcs()) , true));
@@ -223,7 +360,9 @@ function bv_update_gline2($current_post,$where=0,$term_id=0, $excluded_terms = '
 }
 
 function bv_update_catline($current_id,$updatecurrent=NULL){
-	$special_categories_local=$GLOBALS['special_categories'];  
+	$special_categories_local = ( isset( $GLOBALS['special_categories'] ) && is_array( $GLOBALS['special_categories'] ) )
+		? $GLOBALS['special_categories']
+		: array();
 	$current_post=get_post($current_id);
 	if ($current_post->post_type != 'post') return false;
 	if (empty($current_post->geom_point)) return false;
@@ -232,7 +371,12 @@ function bv_update_catline($current_id,$updatecurrent=NULL){
 	$categories=get_the_category($current_id);
 	$arr_ids=array();
 	foreach($categories as $cat){
-		if (!in_array($cat,$special_categories_local) ) $arr_ids[]=$cat->term_id;	
+		// Was in_array( $cat, ... ) -- comparing a WP_Term object against an
+		// array of slug strings, which never matches, so journey lines were
+		// built for 'private', 'standalone' and 'uncategorized' too.
+		if ( ! in_array( $cat->slug, $special_categories_local, true ) ) {
+			$arr_ids[] = $cat->term_id;
+		}
 	}
 	foreach($arr_ids as $term_id){
 		$previous_post=bv_get_nghbpost_geom(false,$current_post,true,array($term_id),$excluded_terms,$taxonomy);
