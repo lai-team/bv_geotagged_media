@@ -22,11 +22,13 @@ It also owns `$special_categories`, a global read by three other codebases.
 - **WP-GeoMeta** — `WP_GeoUtil::LineString()`, `st_startpoint()`, `st_endpoint()`
 - **`voyage`** plugin — `bv_get_adjacent_post()`
 
-Neither plugin dependency is guarded; see Known issues.
+Both plugin dependencies are now guarded — a missing WP-GeoMeta or `voyage`
+makes the geo features go quiet rather than fatal — but the plugin cannot do
+its job without them.
 
 ## The `$special_categories` contract
 
-`index.php:12-13` declares, at **file scope**:
+`index.php:14-15` declares, at **file scope**:
 
 ```php
 global $special_categories;
@@ -50,65 +52,85 @@ disappears.**
 
 ```
 index.php                      The whole plugin
-gtm_plugin_main.php_gentrit    Not loaded — see below
 ```
+
+## Fixed in this pass
+
+The initial commit was a faithful import of what is deployed, with the defects
+recorded rather than fixed. They are fixed now.
+
+- **Special categories were never actually excluded.** `bv_update_catline()`
+  did `in_array( $cat, $special_categories_local )` where `$cat` is a `WP_Term`
+  object and the array holds slug *strings*, so the comparison never matched
+  and journey lines were generated for `private`, `standalone` and
+  `uncategorized` too. Now compares `$cat->slug` with strict `in_array()`.
+  **This changes behaviour on the front end** — posts in those three categories
+  will stop contributing to journey lines, which is what the code always meant
+  to do.
+- **EXIF parsing could fatal on upload.** `read_gps_location()` divided the two
+  halves of each GPS rational without checking the denominator; on PHP 8 that
+  throws `DivisionByZeroError` and takes down the upload request. All six
+  conversions now go through `bv_gtm_exif_rational()`, which returns `0.0`
+  for a zero or missing denominator. The function also bails before calling
+  `exif_read_data()` unless the file is a string, the `exif` extension is
+  loaded, and `isImage()` says it is an image — previously it ran on every
+  attachment, returned `false` for non-images, and then warned on
+  `$info['DateTimeOriginal']`. `datetime` is only returned when EXIF has it.
+- **`gtm_plugin_main.php_gentrit` deleted** (696 lines). It was an abandoned
+  predecessor, never loaded because WordPress only executes `.php` files. It
+  held superseded copies of `read_gps_location`, `bv_attachment`,
+  `bv_thumbnailmeta_postmeta`, `bv_update_gline2`, `bv_update_catline` and
+  `bv_get_nghbpost_geom` — renaming it to `.php` would have fatally redeclared
+  about eight functions.
+- **`isImage()` / `isVideo()` restored at source.** They are the only two
+  things from that file anything still wanted: `voyage`'s story-list template
+  calls them, and `bv_map/includes/compat.php` had to reimplement them. Both
+  definitions are now behind `function_exists()` on *both* sides, so whichever
+  plugin loads first wins and no coordinated deploy is needed. The new
+  implementation parses the path with `wp_parse_url()` before taking the
+  extension, so a URL with a query string (`photo.jpg?w=300`) is classified
+  correctly where the old substring check failed; `WEBP` was added.
+- **Removed the no-op `transition_post_status` hook.**
+  `bv_thumbnailmeta_postmeta()` was attached to both `save_post`
+  (`$post_id, $post, $update`) and `transition_post_status`
+  (`$new_status, $old_status, $post`). On the latter the first parameter is a
+  status string, so the callback returned immediately — it never did anything.
+  Its re-entrancy `remove_action()` also omitted the priority 30 it was
+  registered at, so it would not have matched anyway. `save_post` is unchanged
+  and is the hook that was actually working.
+- **`$special_cat_ids` removed.** It accumulated with `+=` — union *by key* —
+  so every element after the first was discarded and it could only ever hold
+  one id. Nothing read it, and it issued three `get_category_by_slug()`
+  queries at file scope on **every** request, front-end and admin.
+- **`WP_GeoUtil` guarded.** `bv_update_gline2()` now returns early unless the
+  class exists, instead of fatalling on every post save when WP-GeoMeta is
+  deactivated. It also keeps the existing line when `LineString()` returns
+  empty rather than overwriting good data with nothing — see below.
+- **`bv_get_adjacent_post()` guarded**, and `bv_get_nghbpost_geom()`'s
+  signature reordered so the PHP 8.0 deprecation (`optional parameter
+  $get_value declared before required parameter $current_post`) no longer
+  fires. `WP_DEBUG_LOG` is on in production, so that was being written to
+  `debug.log` on every request.
+- **`$special_categories` read defensively** in this plugin too, via `isset()`
+  + `is_array()`, matching the guards `bv_map` and `voyage` already had.
 
 ## Known issues
 
-Recorded, not fixed — the initial commit is a faithful import of what is
-deployed.
-
-- **`gtm_plugin_main.php_gentrit` is never loaded.** The file parses cleanly —
-  it is purely the extension that is wrong. WordPress only executes `.php`
-  files, so the `isImage()` and `isVideo()` helpers it defines do not exist at
-  runtime. `bv_map/includes/compat.php` had to reimplement both,
-  because `voyage`'s story-list template calls them. Either restore the file
-  with a `.php` extension behind `function_exists()` guards, or delete it and
-  treat the `bv_map` copies as canonical.
-- **Special categories are never actually excluded.** `index.php:233` does
-  `in_array( $cat, $special_categories_local )` where `$cat` is a `WP_Term`
-  object and the array holds slug *strings*, so the comparison never matches
-  and journey lines are generated for `private`, `standalone` and
-  `uncategorized` as well. Should compare `$cat->slug`.
-- **`$special_cat_ids` (lines 15-19) is both broken and unused.** It accumulates
-  with `+=`, which is union *by key*, so after the first element every
-  subsequent `+= array( $term_id )` is discarded — it can only ever hold one
-  id. Nothing reads it. It also issues three `get_category_by_slug()` queries at
-  file scope on **every request**, front-end and admin.
-- **EXIF parsing can fatal on upload.** `read_gps_location()` divides the two
-  halves of each GPS rational (`index.php:44-49`) without checking that the
-  denominator exists or is non-zero. On PHP 8 division by zero throws
-  `DivisionByZeroError`, so an image with malformed GPS EXIF takes down the
-  upload request. `exif_read_data()` is also called on every attachment
-  regardless of type and returns `false` for non-images, after which
-  `$info['DateTimeOriginal']` warns.
-- **`bv_thumbnailmeta_postmeta()` is hooked to two actions with incompatible
-  signatures.** `save_post` passes `( $post_id, $post, $update )`;
-  `transition_post_status` passes `( $new_status, $old_status, $post )`. On the
-  latter the first parameter is a status string, so `get_post_type( 'publish' )`
-  returns false and the callback returns immediately — that hook does nothing.
-- **The re-entrancy guard is half-broken.** `remove_action( 'transition_post_status',
-  'bv_thumbnailmeta_postmeta' )` omits the priority, but the hook was registered
-  at 30, so the removal does not match and the action stays attached. The
-  `save_post` removal is correct (both default to 10).
-- **`WP_GeoUtil` is called unguarded** (`index.php:182-183`, `:200`), so
-  deactivating WP-GeoMeta makes every post save fatal. Note also that the
-  installed WP-GeoMeta has been **hand-patched** — `wp-geoutil.php:714` adds
-  `linestring` and `point` to `get_capabilities()` — and a plugin update
-  reverts that, after which `WP_GeoUtil::LineString()` returns null and journey
-  lines quietly stop being written.
-- **`bv_get_adjacent_post()` (`index.php:154`) lives in the `voyage` plugin**
-  and is called with no `function_exists()` guard.
-- **A PHP 8.0 deprecation fires on every load.** `php -l index.php` reports:
-  `bv_get_nghbpost_geom(): Optional parameter $get_value declared before
-  required parameter $current_post is implicitly treated as a required
-  parameter`. Harmless, but `WP_DEBUG_LOG` is enabled in production, so it is
-  being written to `debug.log` on every request.
-
-Not a bug, but worth knowing: several functions read post meta via magic
-properties (`$current_post->geom_point`). That works — `WP_Post::__get()` falls
-back to `get_post_meta()` — but it is undocumented behaviour and reads like an
-error.
+- **WP-GeoMeta is hand-patched.** `wp-geoutil.php:714` adds `linestring` and
+  `point` to `get_capabilities()`. A plugin update reverts it, after which
+  `WP_GeoUtil::__callStatic()` returns null for `LineString()` and journey
+  lines quietly stop being written. `bv_update_gline2()` now preserves the
+  existing line in that case rather than erasing it, but the patch still needs
+  reapplying after any WP-GeoMeta update.
+- **`$special_categories` is still an unguarded file-scope global** owned by
+  this plugin — see the contract section above. The consumers all guard their
+  reads, so the failure mode is silent rather than fatal.
+- Several functions read post meta via magic properties
+  (`$current_post->geom_point`). That works — `WP_Post::__get()` falls back to
+  `get_post_meta()` — but it is undocumented behaviour and reads like an error.
+- `bv_update_gline2()` still carries a large block of commented-out
+  `error_log()` debugging. Left in place; it documents what was tried against
+  the patched WP-GeoMeta.
 
 ## License
 
